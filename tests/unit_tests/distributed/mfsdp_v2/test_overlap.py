@@ -142,10 +142,8 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_mem
 
     allgather_kernels = collect_linked_kernels(prof, _ALL_GATHER_OP_NAME_SUBSTRING)
     reduce_scatter_kernels = collect_linked_kernels(prof, _REDUCE_SCATTER_OP_NAME_SUBSTRING)
-    # Each child layer does a forward and a backward all-gather and one
-    # reduce-scatter. Zero-CTA moves the all-gather to copy-engine memcpys, so it
-    # should not emit all-gather kernels.
-    expected_allgather_kernel_count = 0 if use_symmetric_memory else 2 * num_children
+    # Each child layer does a forward and a backward all-gather and one reduce-scatter.
+    expected_allgather_kernel_count = 2 * num_children
     assert len(allgather_kernels) == expected_allgather_kernel_count, (
         f"Expected {expected_allgather_kernel_count} all-gather kernels, got "
         f"{len(allgather_kernels)}: {[kernel.name for kernel in allgather_kernels]}"
@@ -158,8 +156,7 @@ def test_overlaps_communication_and_compute(distributed_setup, use_symmetric_mem
     allgather_streams = {kernel.device_resource_id for kernel in allgather_kernels}
     reduce_scatter_streams = {kernel.device_resource_id for kernel in reduce_scatter_kernels}
     gemm_streams = {kernel.device_resource_id for kernel in gemm_kernels}
-    if allgather_kernels:
-        assert len(allgather_streams) == 1
+    assert len(allgather_streams) == 1
     assert len(reduce_scatter_streams) == 1
     assert allgather_streams.isdisjoint(reduce_scatter_streams)
     assert allgather_streams.isdisjoint(gemm_streams)
