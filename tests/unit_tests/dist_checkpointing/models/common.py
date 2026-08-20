@@ -190,8 +190,12 @@ def common_test_pg_distribution_cache_e2e(
     # one layout shares paths without a later case clearing an earlier case's files.
     with (
         TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_dir_{layout_id}', sync=True) as cache_dir,
-        TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_ckpt_plain_{layout_id}', sync=True) as ckpt_dir_plain,
-        TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_ckpt_cached_{layout_id}', sync=True) as ckpt_dir_cached,
+        TempNamedDir(
+            tmp_path_dist_ckpt / f'pg_cache_ckpt_plain_{layout_id}', sync=True
+        ) as ckpt_dir_plain,
+        TempNamedDir(
+            tmp_path_dist_ckpt / f'pg_cache_ckpt_cached_{layout_id}', sync=True
+        ) as ckpt_dir_cached,
     ):
         cache_path = str(cache_dir)
         model_A = initialize_model_fn(1)
