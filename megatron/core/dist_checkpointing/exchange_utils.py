@@ -333,7 +333,9 @@ def _cache_format_error(message: str) -> CheckpointingException:
     return CheckpointingException(f"Invalid PG distribution cache: {message}")
 
 
-def _expect_exact_keys(value: _JSONValue, expected: Set[str], context: str) -> Dict[str, _JSONValue]:
+def _expect_exact_keys(
+    value: _JSONValue, expected: Set[str], context: str
+) -> Dict[str, _JSONValue]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise _cache_format_error(f"{context} must be an object")
     actual = set(value)
