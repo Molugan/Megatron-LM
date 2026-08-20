@@ -13,12 +13,16 @@ These tests run at world_size=2 (TP=2) but make no world-size-specific
 assertions, so they hold at any size.
 """
 
+import json
 import os
 
+import pytest
 import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, exchange_utils
+from megatron.core.dist_checkpointing.core import CheckpointingException
 from megatron.core.dist_checkpointing.exchange_utils import (
+    _load_pg_dist_cache,
     _pg_dist_cache_file_path,
     determine_main_replica_uniform_distribution,
 )
@@ -95,6 +99,8 @@ class TestPgDistributionCache:
 
             # The deterministic distribution decisions round-trip exactly.
             assert read.main_rank_for_shard == created.main_rank_for_shard
+            assert read.shards_in_this_group == created.shards_in_this_group
+            assert read.shard_to_metadata == created.shard_to_metadata
             assert read.all_ranks_for_shard == created.all_ranks_for_shard
 
     def test_read_path_skips_the_gather_collective(self, tmp_path_dist_ckpt):
@@ -196,3 +202,54 @@ class TestPgDistributionCache:
             assert shard.shape == (10 * (i + 1),)
             assert torch.equal(shard, torch.full_like(shard, shard[0].item()))
             assert 0 <= shard[0].item() < Utils.world_size
+
+
+def test_cache_loader_rejects_pickle_without_executing_it(tmp_path):
+    marker = tmp_path / "pickle_executed"
+    cache_file = tmp_path / "pg_dist_0.json"
+    malicious_pickle = (
+        b"cposix\nsystem\n(Vtouch " + str(marker).encode("utf-8") + b"\ntR."
+    )
+    cache_file.write_bytes(malicious_pickle)
+
+    with pytest.raises(CheckpointingException, match="not valid UTF-8 JSON"):
+        _load_pg_dist_cache(str(cache_file))
+
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "payload, match",
+    [
+        ({"format_version": 2, "distributions": {}}, "unsupported format version"),
+        (
+            {"format_version": 1, "distributions": {}, "unexpected": True},
+            "unexpected fields",
+        ),
+    ],
+)
+def test_cache_loader_rejects_invalid_schema(tmp_path, payload, match):
+    cache_file = tmp_path / "pg_dist_0.json"
+    cache_file.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(CheckpointingException, match=match):
+        _load_pg_dist_cache(str(cache_file))
+
+
+def test_cache_loader_rejects_duplicate_json_fields(tmp_path):
+    cache_file = tmp_path / "pg_dist_0.json"
+    cache_file.write_text(
+        '{"format_version":1,"format_version":1,"distributions":{}}', encoding="utf-8"
+    )
+
+    with pytest.raises(CheckpointingException, match="duplicate JSON field"):
+        _load_pg_dist_cache(str(cache_file))
+
+
+def test_cache_loader_rejects_oversized_files(tmp_path, monkeypatch):
+    cache_file = tmp_path / "pg_dist_0.json"
+    cache_file.write_bytes(b" " * 17)
+    monkeypatch.setattr(exchange_utils, "PG_DIST_CACHE_MAX_BYTES", 16)
+
+    with pytest.raises(CheckpointingException, match="size limit"):
+        _load_pg_dist_cache(str(cache_file))

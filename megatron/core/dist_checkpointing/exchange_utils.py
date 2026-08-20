@@ -2,13 +2,14 @@
 
 """Utilities for exchanging data between ranks."""
 
+import json
 import logging
 import os
-import pickle
+import tempfile
 from collections import defaultdict
 from functools import reduce
 from itertools import zip_longest
-from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
+from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, cast
 
 import numpy as np
 import torch
@@ -177,6 +178,13 @@ def distribute_shards_to_ranks(
 # Prefix of the per-parallelization-group cache files written/read by the
 # PG-collective caching feature (see `determine_main_replica_uniform_distribution`).
 PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
+_JSONValue = Any
+PG_DIST_CACHE_FORMAT_VERSION = 1
+PG_DIST_CACHE_MAX_BYTES = 256 * 1024 * 1024
+PG_DIST_CACHE_MAX_ENTRIES = 1_000_000
+_PG_DIST_CACHE_MAX_DIMS = 64
+_PG_DIST_CACHE_MAX_KEY_LENGTH = 4096
+_PG_DIST_CACHE_MAX_RANK = 2**31 - 1
 
 # Process-global in-memory cache of the per-group distributions, keyed by the
 # resolved cache file path (which uniquely identifies a (cache dir, group) pair).
@@ -318,7 +326,389 @@ def _pg_dist_cache_file_path(
         str: absolute-or-relative path of the group's cache file.
     """
     ranks = torch.distributed.get_process_group_ranks(parallelization_group)
-    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{min(ranks)}.pkl")
+    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{min(ranks)}.json")
+
+
+def _cache_format_error(message: str) -> CheckpointingException:
+    return CheckpointingException(f"Invalid PG distribution cache: {message}")
+
+
+def _expect_exact_keys(
+    value: _JSONValue, expected: Set[str], context: str
+) -> Dict[str, _JSONValue]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise _cache_format_error(f"{context} must be an object")
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unknown = sorted(actual - expected)
+        raise _cache_format_error(
+            f"{context} has unexpected fields (missing={missing}, unknown={unknown})"
+        )
+    return value
+
+
+def _expect_int(value: _JSONValue, context: str, *, minimum: int = 0, maximum: int) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise _cache_format_error(
+            f"{context} must be an integer in the range [{minimum}, {maximum}]"
+        )
+    return value
+
+
+def _decode_int_tuple(
+    value: _JSONValue,
+    context: str,
+    *,
+    minimum: int = 0,
+    maximum: int = 2**63 - 1,
+    allow_empty: bool = True,
+) -> Tuple[int, ...]:
+    if not isinstance(value, list) or len(value) > _PG_DIST_CACHE_MAX_DIMS:
+        raise _cache_format_error(
+            f"{context} must be a list of at most {_PG_DIST_CACHE_MAX_DIMS} integers"
+        )
+    if not allow_empty and not value:
+        raise _cache_format_error(f"{context} must not be empty")
+    return tuple(
+        _expect_int(item, f"{context}[{index}]", minimum=minimum, maximum=maximum)
+        for index, item in enumerate(value)
+    )
+
+
+def _serialize_flattened_range(value: Optional[slice]) -> Optional[List[int]]:
+    if value is None:
+        return None
+    if (
+        type(value.start) is not int
+        or type(value.stop) is not int
+        or value.step is not None
+        or value.start < 0
+        or value.stop < value.start
+    ):
+        raise _cache_format_error("flattened_range is not serializable")
+    return [value.start, value.stop]
+
+
+def _decode_flattened_range(value: _JSONValue, context: str) -> Optional[Tuple[int, int]]:
+    if value is None:
+        return None
+    decoded = _decode_int_tuple(value, context, allow_empty=False)
+    if len(decoded) != 2 or decoded[1] < decoded[0]:
+        raise _cache_format_error(f"{context} must be null or [start, stop] with stop >= start")
+    return cast(Tuple[int, int], decoded)
+
+
+def _serialize_shard_id(shard_id: _ShardId) -> List[_JSONValue]:
+    key, global_offset, flattened_range = shard_id
+    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+        raise _cache_format_error("shard key is not serializable")
+    offset = list(
+        _decode_int_tuple(list(global_offset), "shard global_offset", allow_empty=True)
+    )
+    if flattened_range is None:
+        serialized_range = None
+    else:
+        serialized_range = list(
+            _decode_flattened_range(list(flattened_range), "shard flattened_range") or ()
+        )
+    return [key, offset, serialized_range]
+
+
+def _decode_shard_id(value: _JSONValue, context: str) -> _ShardId:
+    if not isinstance(value, list) or len(value) != 3:
+        raise _cache_format_error(f"{context} must be [key, global_offset, flattened_range]")
+    key = value[0]
+    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+        raise _cache_format_error(
+            f"{context} key must be a non-empty string of at most "
+            f"{_PG_DIST_CACHE_MAX_KEY_LENGTH} characters"
+        )
+    global_offset = _decode_int_tuple(value[1], f"{context} global_offset")
+    flattened_range = _decode_flattened_range(value[2], f"{context} flattened_range")
+    return (key, global_offset, flattened_range)
+
+
+def _serialize_sharded_tensor(metadata: ShardedTensor) -> Dict[str, _JSONValue]:
+    if metadata.data is not None:
+        raise _cache_format_error("cached ShardedTensor metadata must not contain tensor data")
+    replica_id = metadata.replica_id
+    if type(replica_id) is int:
+        serialized_replica_id: _JSONValue = _expect_int(
+            replica_id, "metadata replica_id", maximum=_PG_DIST_CACHE_MAX_RANK
+        )
+    elif isinstance(replica_id, tuple):
+        serialized_replica_id = list(
+            _decode_int_tuple(
+                list(replica_id),
+                "metadata replica_id",
+                maximum=_PG_DIST_CACHE_MAX_RANK,
+                allow_empty=False,
+            )
+        )
+    else:
+        raise _cache_format_error("metadata replica_id must be an integer or tuple of integers")
+    return {
+        "key": _serialize_shard_id(_sharded_tensor_shard_id(metadata))[0],
+        "dtype": str(metadata.dtype),
+        "local_shape": list(metadata.local_shape),
+        "global_shape": list(metadata.global_shape),
+        "global_offset": list(metadata.global_offset),
+        "axis_fragmentations": (
+            None if metadata.axis_fragmentations is None else list(metadata.axis_fragmentations)
+        ),
+        "replica_id": serialized_replica_id,
+        "prepend_axis_num": metadata.prepend_axis_num,
+        "allow_shape_mismatch": metadata.allow_shape_mismatch,
+        "flattened_range": _serialize_flattened_range(metadata.flattened_range),
+    }
+
+
+def _decode_sharded_tensor(value: _JSONValue, shard_id: _ShardId, context: str) -> ShardedTensor:
+    obj = _expect_exact_keys(
+        value,
+        {
+            "key",
+            "dtype",
+            "local_shape",
+            "global_shape",
+            "global_offset",
+            "axis_fragmentations",
+            "replica_id",
+            "prepend_axis_num",
+            "allow_shape_mismatch",
+            "flattened_range",
+        },
+        context,
+    )
+    key = obj["key"]
+    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+        raise _cache_format_error(f"{context}.key is invalid")
+    dtype_name = obj["dtype"]
+    if not isinstance(dtype_name, str) or not dtype_name.startswith("torch."):
+        raise _cache_format_error(f"{context}.dtype is invalid")
+    dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+    if not isinstance(dtype, torch.dtype) or str(dtype) != dtype_name:
+        raise _cache_format_error(f"{context}.dtype is not a supported torch dtype")
+    local_shape = _decode_int_tuple(obj["local_shape"], f"{context}.local_shape")
+    global_shape = _decode_int_tuple(obj["global_shape"], f"{context}.global_shape")
+    global_offset = _decode_int_tuple(obj["global_offset"], f"{context}.global_offset")
+    axis_fragmentations_value = obj["axis_fragmentations"]
+    axis_fragmentations = (
+        None
+        if axis_fragmentations_value is None
+        else _decode_int_tuple(
+            axis_fragmentations_value,
+            f"{context}.axis_fragmentations",
+            minimum=1,
+        )
+    )
+    replica_id_value = obj["replica_id"]
+    if type(replica_id_value) is int:
+        replica_id = _expect_int(
+            replica_id_value, f"{context}.replica_id", maximum=_PG_DIST_CACHE_MAX_RANK
+        )
+    else:
+        replica_id = _decode_int_tuple(
+            replica_id_value,
+            f"{context}.replica_id",
+            maximum=_PG_DIST_CACHE_MAX_RANK,
+            allow_empty=False,
+        )
+    prepend_axis_num = _expect_int(
+        obj["prepend_axis_num"],
+        f"{context}.prepend_axis_num",
+        maximum=_PG_DIST_CACHE_MAX_DIMS,
+    )
+    allow_shape_mismatch = obj["allow_shape_mismatch"]
+    if type(allow_shape_mismatch) is not bool:
+        raise _cache_format_error(f"{context}.allow_shape_mismatch must be a boolean")
+    flattened_range_tuple = _decode_flattened_range(
+        obj["flattened_range"], f"{context}.flattened_range"
+    )
+    flattened_range = (
+        None if flattened_range_tuple is None else slice(*flattened_range_tuple)
+    )
+    if (key, global_offset, flattened_range_tuple) != shard_id:
+        raise _cache_format_error(f"{context} does not match its shard identifier")
+    try:
+        return ShardedTensor(
+            key=key,
+            data=None,
+            dtype=dtype,
+            local_shape=local_shape,
+            global_shape=global_shape,
+            global_offset=global_offset,
+            axis_fragmentations=axis_fragmentations,
+            replica_id=replica_id,
+            prepend_axis_num=prepend_axis_num,
+            allow_shape_mismatch=allow_shape_mismatch,
+            flattened_range=flattened_range,
+        )
+    except (CheckpointingException, TypeError, ValueError) as exc:
+        raise _cache_format_error(f"{context} contains invalid ShardedTensor metadata") from exc
+
+
+def _shard_id_sort_key(shard_id: _ShardId) -> str:
+    return json.dumps(_serialize_shard_id(shard_id), separators=(",", ":"))
+
+
+def _serialize_shard_mapping(
+    mapping: Dict[_ShardId, Any], value_name: str, serializer: Callable[[Any], _JSONValue]
+) -> List[Dict[str, _JSONValue]]:
+    return [
+        {"shard_id": _serialize_shard_id(shard_id), value_name: serializer(value)}
+        for shard_id, value in sorted(mapping.items(), key=lambda item: _shard_id_sort_key(item[0]))
+    ]
+
+
+def _decode_shard_mapping(
+    value: _JSONValue,
+    value_name: str,
+    context: str,
+    decoder: Callable[[_JSONValue, _ShardId, str], Any],
+) -> Dict[_ShardId, Any]:
+    if not isinstance(value, list) or len(value) > PG_DIST_CACHE_MAX_ENTRIES:
+        raise _cache_format_error(
+            f"{context} must be a list of at most {PG_DIST_CACHE_MAX_ENTRIES} entries"
+        )
+    result = {}
+    for index, entry_value in enumerate(value):
+        entry_context = f"{context}[{index}]"
+        entry = _expect_exact_keys(entry_value, {"shard_id", value_name}, entry_context)
+        shard_id = _decode_shard_id(entry["shard_id"], f"{entry_context}.shard_id")
+        if shard_id in result:
+            raise _cache_format_error(f"{context} contains a duplicate shard identifier")
+        result[shard_id] = decoder(entry[value_name], shard_id, f"{entry_context}.{value_name}")
+    return result
+
+
+def _serialize_shard_distribution(
+    distribution: ShardDistribution,
+) -> Dict[str, _JSONValue]:
+    return {
+        "main_rank_for_shard": _serialize_shard_mapping(
+            distribution.main_rank_for_shard, "rank", lambda rank: rank
+        ),
+        "shards_in_this_group": [
+            _serialize_shard_id(shard_id)
+            for shard_id in sorted(distribution.shards_in_this_group, key=_shard_id_sort_key)
+        ],
+        "shard_to_metadata": _serialize_shard_mapping(
+            distribution.shard_to_metadata, "metadata", _serialize_sharded_tensor
+        ),
+        "all_ranks_for_shard": _serialize_shard_mapping(
+            distribution.all_ranks_for_shard, "ranks", lambda ranks: ranks
+        ),
+    }
+
+
+def _decode_shard_distribution(value: _JSONValue, context: str) -> ShardDistribution:
+    obj = _expect_exact_keys(
+        value,
+        {
+            "main_rank_for_shard",
+            "shards_in_this_group",
+            "shard_to_metadata",
+            "all_ranks_for_shard",
+        },
+        context,
+    )
+    main_rank_for_shard = _decode_shard_mapping(
+        obj["main_rank_for_shard"],
+        "rank",
+        f"{context}.main_rank_for_shard",
+        lambda rank, _shard_id, item_context: _expect_int(
+            rank, item_context, maximum=_PG_DIST_CACHE_MAX_RANK
+        ),
+    )
+    shards_value = obj["shards_in_this_group"]
+    if not isinstance(shards_value, list) or len(shards_value) > PG_DIST_CACHE_MAX_ENTRIES:
+        raise _cache_format_error(
+            f"{context}.shards_in_this_group must be a list of at most "
+            f"{PG_DIST_CACHE_MAX_ENTRIES} entries"
+        )
+    shards_in_this_group = {
+        _decode_shard_id(shard, f"{context}.shards_in_this_group[{index}]")
+        for index, shard in enumerate(shards_value)
+    }
+    if len(shards_in_this_group) != len(shards_value):
+        raise _cache_format_error(f"{context}.shards_in_this_group contains duplicates")
+    shard_to_metadata = _decode_shard_mapping(
+        obj["shard_to_metadata"],
+        "metadata",
+        f"{context}.shard_to_metadata",
+        _decode_sharded_tensor,
+    )
+    all_ranks_for_shard = _decode_shard_mapping(
+        obj["all_ranks_for_shard"],
+        "ranks",
+        f"{context}.all_ranks_for_shard",
+        lambda ranks, _shard_id, item_context: list(
+            _decode_int_tuple(
+                ranks,
+                item_context,
+                maximum=_PG_DIST_CACHE_MAX_RANK,
+                allow_empty=False,
+            )
+        ),
+    )
+    distribution_keys = set(main_rank_for_shard)
+    if distribution_keys != shards_in_this_group or distribution_keys != set(all_ranks_for_shard):
+        raise _cache_format_error(f"{context} shard collections are inconsistent")
+    if not distribution_keys <= set(shard_to_metadata):
+        raise _cache_format_error(f"{context} is missing ShardedTensor metadata")
+    if set(shard_to_metadata) != set(all_ranks_for_shard):
+        raise _cache_format_error(f"{context} metadata shard collection is inconsistent")
+    for shard_id, ranks in all_ranks_for_shard.items():
+        if len(set(ranks)) != len(ranks):
+            raise _cache_format_error(f"{context} contains duplicate ranks for a shard")
+        if main_rank_for_shard[shard_id] not in ranks:
+            raise _cache_format_error(f"{context} main rank is not among the shard ranks")
+    return ShardDistribution(
+        main_rank_for_shard, shards_in_this_group, shard_to_metadata, all_ranks_for_shard
+    )
+
+
+def _serialize_pg_dist_cache(
+    distributions: Dict[bool, ShardDistribution],
+) -> Dict[str, _JSONValue]:
+    if set(distributions) != {False, True}:
+        raise _cache_format_error("both save and load distributions are required")
+    return {
+        "format_version": PG_DIST_CACHE_FORMAT_VERSION,
+        "distributions": {
+            "save": _serialize_shard_distribution(distributions[False]),
+            "load": _serialize_shard_distribution(distributions[True]),
+        },
+    }
+
+
+def _reject_duplicate_json_keys(
+    pairs: List[Tuple[str, _JSONValue]],
+) -> Dict[str, _JSONValue]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _cache_format_error(f"duplicate JSON field {key!r}")
+        result[key] = value
+    return result
+
+
+def _decode_pg_dist_cache(value: _JSONValue) -> Dict[bool, ShardDistribution]:
+    obj = _expect_exact_keys(value, {"format_version", "distributions"}, "root")
+    version = _expect_int(obj["format_version"], "format_version", minimum=1, maximum=2**31 - 1)
+    if version != PG_DIST_CACHE_FORMAT_VERSION:
+        raise _cache_format_error(
+            f"unsupported format version {version}; expected {PG_DIST_CACHE_FORMAT_VERSION}"
+        )
+    distributions = _expect_exact_keys(
+        obj["distributions"], {"save", "load"}, "distributions"
+    )
+    return {
+        False: _decode_shard_distribution(distributions["save"], "distributions.save"),
+        True: _decode_shard_distribution(distributions["load"], "distributions.load"),
+    }
 
 
 def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
@@ -328,10 +718,10 @@ def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
     variant) so the caller can memoize both in the process-global cache and serve
     later save/load calls without re-opening the file.
 
-    Performs no existence/validity checks by design (see the feature docs): the
-    user opts into the cache only when they guarantee the config and world size
-    match the run that created it, trading safety for the lowest possible
-    latency.
+    The cache uses a versioned JSON schema and rejects malformed, oversized, or
+    unknown data. It intentionally does not attempt to prove that the cached
+    distribution matches the current model config and world size; callers retain
+    responsibility for that compatibility contract.
 
     Args:
         cache_file (str): resolved path of the group's cache file.
@@ -340,7 +730,36 @@ def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
         Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map.
     """
     with open(cache_file, "rb") as f:
-        return pickle.load(f)
+        try:
+            file_size = os.fstat(f.fileno()).st_size
+        except OSError as exc:
+            raise _cache_format_error("unable to determine file size") from exc
+        if file_size > PG_DIST_CACHE_MAX_BYTES:
+            raise _cache_format_error(
+                f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit"
+            )
+        raw = f.read(PG_DIST_CACHE_MAX_BYTES + 1)
+    if len(raw) > PG_DIST_CACHE_MAX_BYTES:
+        raise _cache_format_error(
+            f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _cache_format_error("file is not valid UTF-8 JSON") from exc
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=lambda constant: (_ for _ in ()).throw(
+                _cache_format_error(f"invalid JSON constant {constant!r}")
+            ),
+        )
+    except json.JSONDecodeError as exc:
+        raise _cache_format_error("file is not valid UTF-8 JSON") from exc
+    except RecursionError as exc:
+        raise _cache_format_error("JSON nesting is too deep") from exc
+    return _decode_pg_dist_cache(value)
 
 
 def _create_pg_dist_cache(
@@ -377,10 +796,30 @@ def _create_pg_dist_cache(
     if torch.distributed.get_rank() == min(ranks):
         os.makedirs(cache_path, exist_ok=True)
         path = _pg_dist_cache_file_path(cache_path, parallelization_group)
-        tmp_path = f"{path}.tmp.{torch.distributed.get_rank()}"
-        with open(tmp_path, "wb") as f:
-            pickle.dump(both, f)
-        os.replace(tmp_path, path)
+        tmp_path = None
+        try:
+            payload = json.dumps(
+                _serialize_pg_dist_cache(both), separators=(",", ":"), sort_keys=True
+            )
+            if len(payload.encode("utf-8")) > PG_DIST_CACHE_MAX_BYTES:
+                raise _cache_format_error(
+                    f"serialized cache exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit"
+                )
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=cache_path,
+                prefix=f".{os.path.basename(path)}.",
+                delete=False,
+            ) as f:
+                tmp_path = f.name
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if tmp_path is not None and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
     return both
 
 
