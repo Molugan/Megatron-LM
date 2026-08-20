@@ -207,9 +207,7 @@ class TestPgDistributionCache:
 def test_cache_loader_rejects_pickle_without_executing_it(tmp_path):
     marker = tmp_path / "pickle_executed"
     cache_file = tmp_path / "pg_dist_0.json"
-    malicious_pickle = (
-        b"cposix\nsystem\n(Vtouch " + str(marker).encode("utf-8") + b"\ntR."
-    )
+    malicious_pickle = b"cposix\nsystem\n(Vtouch " + str(marker).encode("utf-8") + b"\ntR."
     cache_file.write_bytes(malicious_pickle)
 
     with pytest.raises(CheckpointingException, match="not valid UTF-8 JSON"):
@@ -222,10 +220,7 @@ def test_cache_loader_rejects_pickle_without_executing_it(tmp_path):
     "payload, match",
     [
         ({"format_version": 2, "distributions": {}}, "unsupported format version"),
-        (
-            {"format_version": 1, "distributions": {}, "unexpected": True},
-            "unexpected fields",
-        ),
+        ({"format_version": 1, "distributions": {}, "unexpected": True}, "unexpected fields"),
     ],
 )
 def test_cache_loader_rejects_invalid_schema(tmp_path, payload, match):

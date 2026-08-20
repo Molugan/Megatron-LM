@@ -333,9 +333,7 @@ def _cache_format_error(message: str) -> CheckpointingException:
     return CheckpointingException(f"Invalid PG distribution cache: {message}")
 
 
-def _expect_exact_keys(
-    value: _JSONValue, expected: Set[str], context: str
-) -> Dict[str, _JSONValue]:
+def _expect_exact_keys(value: _JSONValue, expected: Set[str], context: str) -> Dict[str, _JSONValue]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise _cache_format_error(f"{context} must be an object")
     actual = set(value)
@@ -401,11 +399,9 @@ def _decode_flattened_range(value: _JSONValue, context: str) -> Optional[Tuple[i
 
 def _serialize_shard_id(shard_id: _ShardId) -> List[_JSONValue]:
     key, global_offset, flattened_range = shard_id
-    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+    if not (isinstance(key, str) and 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH):
         raise _cache_format_error("shard key is not serializable")
-    offset = list(
-        _decode_int_tuple(list(global_offset), "shard global_offset", allow_empty=True)
-    )
+    offset = list(_decode_int_tuple(list(global_offset), "shard global_offset", allow_empty=True))
     if flattened_range is None:
         serialized_range = None
     else:
@@ -419,7 +415,7 @@ def _decode_shard_id(value: _JSONValue, context: str) -> _ShardId:
     if not isinstance(value, list) or len(value) != 3:
         raise _cache_format_error(f"{context} must be [key, global_offset, flattened_range]")
     key = value[0]
-    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+    if not (isinstance(key, str) and 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH):
         raise _cache_format_error(
             f"{context} key must be a non-empty string of at most "
             f"{_PG_DIST_CACHE_MAX_KEY_LENGTH} characters"
@@ -482,7 +478,7 @@ def _decode_sharded_tensor(value: _JSONValue, shard_id: _ShardId, context: str) 
         context,
     )
     key = obj["key"]
-    if not isinstance(key, str) or not 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH:
+    if not (isinstance(key, str) and 0 < len(key) <= _PG_DIST_CACHE_MAX_KEY_LENGTH):
         raise _cache_format_error(f"{context}.key is invalid")
     dtype_name = obj["dtype"]
     if not isinstance(dtype_name, str) or not dtype_name.startswith("torch."):
@@ -498,9 +494,7 @@ def _decode_sharded_tensor(value: _JSONValue, shard_id: _ShardId, context: str) 
         None
         if axis_fragmentations_value is None
         else _decode_int_tuple(
-            axis_fragmentations_value,
-            f"{context}.axis_fragmentations",
-            minimum=1,
+            axis_fragmentations_value, f"{context}.axis_fragmentations", minimum=1
         )
     )
     replica_id_value = obj["replica_id"]
@@ -516,9 +510,7 @@ def _decode_sharded_tensor(value: _JSONValue, shard_id: _ShardId, context: str) 
             allow_empty=False,
         )
     prepend_axis_num = _expect_int(
-        obj["prepend_axis_num"],
-        f"{context}.prepend_axis_num",
-        maximum=_PG_DIST_CACHE_MAX_DIMS,
+        obj["prepend_axis_num"], f"{context}.prepend_axis_num", maximum=_PG_DIST_CACHE_MAX_DIMS
     )
     allow_shape_mismatch = obj["allow_shape_mismatch"]
     if type(allow_shape_mismatch) is not bool:
@@ -526,9 +518,7 @@ def _decode_sharded_tensor(value: _JSONValue, shard_id: _ShardId, context: str) 
     flattened_range_tuple = _decode_flattened_range(
         obj["flattened_range"], f"{context}.flattened_range"
     )
-    flattened_range = (
-        None if flattened_range_tuple is None else slice(*flattened_range_tuple)
-    )
+    flattened_range = None if flattened_range_tuple is None else slice(*flattened_range_tuple)
     if (key, global_offset, flattened_range_tuple) != shard_id:
         raise _cache_format_error(f"{context} does not match its shard identifier")
     try:
@@ -583,9 +573,7 @@ def _decode_shard_mapping(
     return result
 
 
-def _serialize_shard_distribution(
-    distribution: ShardDistribution,
-) -> Dict[str, _JSONValue]:
+def _serialize_shard_distribution(distribution: ShardDistribution) -> Dict[str, _JSONValue]:
     return {
         "main_rank_for_shard": _serialize_shard_mapping(
             distribution.main_rank_for_shard, "rank", lambda rank: rank
@@ -606,12 +594,7 @@ def _serialize_shard_distribution(
 def _decode_shard_distribution(value: _JSONValue, context: str) -> ShardDistribution:
     obj = _expect_exact_keys(
         value,
-        {
-            "main_rank_for_shard",
-            "shards_in_this_group",
-            "shard_to_metadata",
-            "all_ranks_for_shard",
-        },
+        {"main_rank_for_shard", "shards_in_this_group", "shard_to_metadata", "all_ranks_for_shard"},
         context,
     )
     main_rank_for_shard = _decode_shard_mapping(
@@ -635,10 +618,7 @@ def _decode_shard_distribution(value: _JSONValue, context: str) -> ShardDistribu
     if len(shards_in_this_group) != len(shards_value):
         raise _cache_format_error(f"{context}.shards_in_this_group contains duplicates")
     shard_to_metadata = _decode_shard_mapping(
-        obj["shard_to_metadata"],
-        "metadata",
-        f"{context}.shard_to_metadata",
-        _decode_sharded_tensor,
+        obj["shard_to_metadata"], "metadata", f"{context}.shard_to_metadata", _decode_sharded_tensor
     )
     all_ranks_for_shard = _decode_shard_mapping(
         obj["all_ranks_for_shard"],
@@ -646,10 +626,7 @@ def _decode_shard_distribution(value: _JSONValue, context: str) -> ShardDistribu
         f"{context}.all_ranks_for_shard",
         lambda ranks, _shard_id, item_context: list(
             _decode_int_tuple(
-                ranks,
-                item_context,
-                maximum=_PG_DIST_CACHE_MAX_RANK,
-                allow_empty=False,
+                ranks, item_context, maximum=_PG_DIST_CACHE_MAX_RANK, allow_empty=False
             )
         ),
     )
@@ -670,9 +647,7 @@ def _decode_shard_distribution(value: _JSONValue, context: str) -> ShardDistribu
     )
 
 
-def _serialize_pg_dist_cache(
-    distributions: Dict[bool, ShardDistribution],
-) -> Dict[str, _JSONValue]:
+def _serialize_pg_dist_cache(distributions: Dict[bool, ShardDistribution]) -> Dict[str, _JSONValue]:
     if set(distributions) != {False, True}:
         raise _cache_format_error("both save and load distributions are required")
     return {
@@ -684,9 +659,7 @@ def _serialize_pg_dist_cache(
     }
 
 
-def _reject_duplicate_json_keys(
-    pairs: List[Tuple[str, _JSONValue]],
-) -> Dict[str, _JSONValue]:
+def _reject_duplicate_json_keys(pairs: List[Tuple[str, _JSONValue]]) -> Dict[str, _JSONValue]:
     result = {}
     for key, value in pairs:
         if key in result:
@@ -702,9 +675,7 @@ def _decode_pg_dist_cache(value: _JSONValue) -> Dict[bool, ShardDistribution]:
         raise _cache_format_error(
             f"unsupported format version {version}; expected {PG_DIST_CACHE_FORMAT_VERSION}"
         )
-    distributions = _expect_exact_keys(
-        obj["distributions"], {"save", "load"}, "distributions"
-    )
+    distributions = _expect_exact_keys(obj["distributions"], {"save", "load"}, "distributions")
     return {
         False: _decode_shard_distribution(distributions["save"], "distributions.save"),
         True: _decode_shard_distribution(distributions["load"], "distributions.load"),
@@ -735,14 +706,10 @@ def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
         except OSError as exc:
             raise _cache_format_error("unable to determine file size") from exc
         if file_size > PG_DIST_CACHE_MAX_BYTES:
-            raise _cache_format_error(
-                f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit"
-            )
+            raise _cache_format_error(f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit")
         raw = f.read(PG_DIST_CACHE_MAX_BYTES + 1)
     if len(raw) > PG_DIST_CACHE_MAX_BYTES:
-        raise _cache_format_error(
-            f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit"
-        )
+        raise _cache_format_error(f"file exceeds the {PG_DIST_CACHE_MAX_BYTES}-byte size limit")
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
