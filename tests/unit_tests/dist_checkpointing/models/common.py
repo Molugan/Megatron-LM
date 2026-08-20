@@ -142,7 +142,11 @@ def common_test_parallel_reconfiguration_e2e(
 
 
 def common_test_pg_distribution_cache_e2e(
-    initialize_model_fn, tmp_path_dist_ckpt, parallelization_group, sharded_state_dict_fn=None
+    initialize_model_fn,
+    tmp_path_dist_ckpt,
+    parallelization_group,
+    layout_id,
+    sharded_state_dict_fn=None,
 ):
     """Save/load a real sharded model with and without the PG-distribution cache.
 
@@ -182,10 +186,12 @@ def common_test_pg_distribution_cache_e2e(
         assert all('_extra_state' in k for k in unexpected_keys)
         return state_dict
 
+    # This root is session-scoped. Isolate parametrized layouts so each rank in
+    # one layout shares paths without a later case clearing an earlier case's files.
     with (
-        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_dir', sync=True) as cache_dir,
-        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_ckpt_plain', sync=True) as ckpt_dir_plain,
-        TempNamedDir(tmp_path_dist_ckpt / 'pg_cache_ckpt_cached', sync=True) as ckpt_dir_cached,
+        TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_dir_{layout_id}', sync=True) as cache_dir,
+        TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_ckpt_plain_{layout_id}', sync=True) as ckpt_dir_plain,
+        TempNamedDir(tmp_path_dist_ckpt / f'pg_cache_ckpt_cached_{layout_id}', sync=True) as ckpt_dir_cached,
     ):
         cache_path = str(cache_dir)
         model_A = initialize_model_fn(1)

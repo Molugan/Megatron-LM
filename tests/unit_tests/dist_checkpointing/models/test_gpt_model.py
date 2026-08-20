@@ -174,6 +174,7 @@ class TestGPTModelReconfiguration:
             ),
             tmp_path_dist_ckpt,
             ps.get_data_parallel_group(with_context_parallel=True),
+            f"gpt_tp{tp}_pp{pp}",
         )
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):

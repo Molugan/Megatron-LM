@@ -157,6 +157,7 @@ class TestExpertLayerReconfiguration:
             lambda seed: initialize_expert_layer(seed, expert_type=expert_type),
             tmp_path_dist_ckpt,
             parallelization_group,
+            f"moe_tp{tp}_pp{pp}_ep{ep}_{expert_type}_{save_load_process_group}",
             sharded_state_dict_fn=lambda model: model.sharded_state_dict(
                 prefix=f'{parallel_state.get_pipeline_model_parallel_rank()}.'
             ),
